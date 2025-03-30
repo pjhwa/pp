@@ -173,7 +173,7 @@ def calculate_volume_change(df):
 
 ### VWAP (Volume Weighted Average Price)
 def calculate_vwap(df):
-    typical_price = (df['High'] + df['Low'] + df['Close'])….mean()
+    typical_price = (df['High'] + df['Low'] + df['Close']).mean()
     df['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
     return df
 

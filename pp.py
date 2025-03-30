@@ -5,12 +5,14 @@ import yfinance as yf
 import argparse
 import sqlite3
 import os
+from tabulate import tabulate
 
-# SQLite 데이터베이스 파일명 및 거래 내역 파일명
+# SQLite database and trade log file names
 DB_FILE = 'market_data.db'
 TRADE_LOG_FILE = 'trade_log.csv'
+INITIAL_INVESTMENT = 100000.0  # Default initial investment ($100,000)
 
-# Fear & Greed Index 데이터 수집 및 저장 함수
+# Fear & Greed Index data collection and storage
 def get_fear_greed_data(conn):
     today = datetime.now()
     start_date = today - timedelta(days=730)
@@ -26,11 +28,10 @@ def get_fear_greed_data(conn):
         df['date'] = pd.to_datetime(df['x'], unit='ms').dt.date
         df = df[['date', 'y']].rename(columns={'y': 'fear_greed_index'})
         df.to_sql('fear_greed_index', conn, if_exists='replace', index=False)
-        print("Fear & Greed Index data saved to SQLite.")
     except Exception as e:
         print(f"Fear & Greed Index data collection error: {e}")
 
-# 주식 데이터 수집 및 저장 함수
+# Stock data collection and storage
 def get_stock_data(ticker, conn):
     try:
         cursor = conn.cursor()
@@ -45,7 +46,6 @@ def get_stock_data(ticker, conn):
         stock = yf.Ticker(ticker)
         hist = stock.history(start=start_date, end=datetime.now().date())
         if hist.empty:
-            print(f"No new data available for {ticker}.")
             return
         hist = hist.reset_index()
         df = hist[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
@@ -58,13 +58,10 @@ def get_stock_data(ticker, conn):
         if not df.empty:
             df['Date'] = df['Date'].astype(str)
             df.to_sql('stock_data', conn, if_exists='append', index=False)
-            print(f"New data for {ticker} saved to SQLite.")
-        else:
-            print(f"No new data to save for {ticker} after filtering duplicates.")
     except Exception as e:
         print(f"{ticker} data collection error: {e}")
 
-# VIX 지수 데이터 수집 및 저장 함수
+# VIX index data collection and storage
 def get_vix_data(conn):
     try:
         cursor = conn.cursor()
@@ -78,7 +75,6 @@ def get_vix_data(conn):
         
         vix_df = yf.download("^VIX", start=start_date, end=datetime.now().date())
         if vix_df.empty:
-            print("No new data available for VIX.")
             return
         vix_df = vix_df[['Close']].reset_index()
         vix_df['Date'] = vix_df['Date'].dt.strftime('%Y-%m-%d')
@@ -87,17 +83,12 @@ def get_vix_data(conn):
         existing_dates = pd.read_sql("SELECT Date FROM vix_data", conn)['Date'].tolist()
         vix_df = vix_df[~vix_df['Date'].isin(existing_dates)]
         if not vix_df.empty:
-            cursor = conn.cursor()
-            data_to_insert = vix_df[['Date', 'VIX_Close']].values.tolist()
-            cursor.executemany("INSERT INTO vix_data (Date, VIX_Close) VALUES (?, ?)", data_to_insert)
+            cursor.executemany("INSERT INTO vix_data (Date, VIX_Close) VALUES (?, ?)", vix_df[['Date', 'VIX_Close']].values.tolist())
             conn.commit()
-            print("New VIX data saved to SQLite.")
-        else:
-            print("No new data to save for VIX after filtering duplicates.")
     except Exception as e:
         print(f"VIX data collection error: {e}")
 
-# 기술적 지표 계산 함수들 (생략: 기존 코드 유지)
+# Technical indicator calculation functions
 def calculate_rsi(df, period=14):
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -107,13 +98,7 @@ def calculate_rsi(df, period=14):
     return df
 
 def calculate_weekly_rsi(df, period=14):
-    df_weekly = df.resample('W', on='Date').agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    })
+    df_weekly = df.resample('W', on='Date').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'})
     df_weekly = calculate_rsi(df_weekly, period)
     df_weekly = df_weekly.rename(columns={f'RSI_{period}': 'Weekly_RSI'})
     return df_weekly['Weekly_RSI']
@@ -183,7 +168,7 @@ def calculate_all_indicators(df):
     df = df.join(weekly_rsi, on='Date')
     return df
 
-# 지표를 데이터베이스에 저장하는 함수
+# Save indicators to database
 def save_indicators_to_db(df, ticker, conn):
     indicators = ['RSI_14', 'RSI_5', 'MACD', 'Signal', 'MACD_Histogram', 'Short_MACD', 'Short_Signal', 'Short_MACD_Histogram',
                   'SMA20', 'Upper_Band', 'Lower_Band', 'BB_Width', 'Percent_K', 'Percent_D', 'OBV', 'ATR', 'SMA5', 'SMA10', 'SMA50', 'SMA200',
@@ -195,44 +180,32 @@ def save_indicators_to_db(df, ticker, conn):
     df_indicators = df_indicators[~df_indicators['Date'].isin(existing_dates)]
     if not df_indicators.empty:
         df_indicators.to_sql('technical_indicators', conn, if_exists='append', index=False)
-        print(f"Indicators for {ticker} saved to SQLite.")
-    else:
-        print(f"No new indicators to save for {ticker}.")
 
-# 포트폴리오 관리 로직
-
-# 거래내역을 데이터베이스에 저장하는 함수
+# Load trade log into database
 def load_trade_log_to_db(conn):
     if not os.path.exists(TRADE_LOG_FILE):
-        print(f"No trade log file found at {TRADE_LOG_FILE}.")
         return
     df = pd.read_csv(TRADE_LOG_FILE)
-    df['Shares'] = df['Shares'].astype(int)  # 소수점 거래 금지
+    df['Shares'] = df['Shares'].astype(int)
     df.to_sql('trade_log', conn, if_exists='replace', index=False)
-    print("Trade log loaded into SQLite.")
 
-# 포트폴리오 상태를 초기화하고 거래를 처리하는 함수
+# Process portfolio and update state
 def process_portfolio(conn):
     cursor = conn.cursor()
-    
-    # 기존 portfolio_state 테이블 비우기
     cursor.execute("DELETE FROM portfolio_state")
-    
-    # 거래내역 로드
     trade_log = pd.read_sql("SELECT * FROM trade_log ORDER BY Date", conn)
     if trade_log.empty:
-        print("No trade log data to process.")
         return
     
     cash = 0.0
     holdings = {}
-    transaction_cost_rate = 0.001  # 0.1% 거래 비용
+    transaction_cost_rate = 0.001
     
     for _, trade in trade_log.iterrows():
         date = trade['Date']
         ticker = trade['Ticker']
         action = trade['Action'].lower()
-        shares = int(trade['Shares'])  # 정수로 변환
+        shares = int(trade['Shares'])
         price = trade['Price']
         trade_amount = shares * price
         cost = trade_amount * transaction_cost_rate
@@ -251,95 +224,131 @@ def process_portfolio(conn):
                 print(f"Error: Not enough shares to sell {ticker} on {date}")
                 continue
         elif action == 'hold':
-            # 초기 보유량 설정
             holdings[ticker] = shares
         
-        # 현재 상태 저장
         cursor.execute("INSERT INTO portfolio_state (Date, Cash, Ticker, Shares) VALUES (?, ?, ?, ?)",
                        (date, cash, ticker, holdings[ticker]))
     
     conn.commit()
-    print("Portfolio state processed and saved to SQLite.")
 
-# 메인 함수
+# Text-based portfolio visualization
+def visualize_portfolio_text(conn, tickers, initial_investment):
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(Date) FROM portfolio_state")
+    latest_date = cursor.fetchone()[0]
+    if not latest_date:
+        return
+    
+    portfolio_data = pd.read_sql(f"SELECT * FROM portfolio_state WHERE Date='{latest_date}'", conn)
+    if portfolio_data.empty:
+        return
+    
+    cash = portfolio_data['Cash'].iloc[0]
+    holdings = {row['Ticker']: row['Shares'] for _, row in portfolio_data.iterrows()}
+    
+    prices = {}
+    for ticker in tickers:
+        cursor.execute(f"SELECT Close FROM stock_data WHERE Ticker='{ticker}' ORDER BY Date DESC LIMIT 1")
+        result = cursor.fetchone()
+        prices[ticker] = result[0] if result else 0.0
+    
+    total_value = cash
+    portfolio_values = []
+    for ticker in tickers:
+        if ticker in holdings:
+            value = holdings[ticker] * prices.get(ticker, 0.0)
+            total_value += value
+            portfolio_values.append({
+                'Asset': ticker,
+                'Shares': holdings[ticker],
+                'Price': f"${prices.get(ticker, 0.0):.2f}",
+                'Value': f"${value:.2f}",
+                'Weight (%)': f"{(value / total_value * 100):.2f}%"
+            })
+    
+    portfolio_values.append({
+        'Asset': 'Cash',
+        'Shares': '-',
+        'Price': '-',
+        'Value': f"${cash:.2f}",
+        'Weight (%)': f"{(cash / total_value * 100):.2f}%"
+    })
+    
+    return_rate = ((total_value - initial_investment) / initial_investment) * 100
+    
+    print(f"\n📊 Portfolio Composition on {latest_date}")
+    print(f"💰 Initial Investment: ${initial_investment:.2f}")
+    print(f"💰 Current Portfolio Value: ${total_value:.2f}")
+    print(f"📈 Return Rate: {return_rate:.2f}%")
+    df_portfolio = pd.DataFrame(portfolio_values)
+    print(tabulate(df_portfolio, headers='keys', tablefmt='fancy_grid', showindex=False))
+
+# Weight adjustment notifications with buy/sell signals
+def check_weight_adjustment(df_dict, tickers):
+    for ticker in tickers:
+        df = df_dict[ticker]
+        latest = df.iloc[-1]
+        
+        if latest['RSI_14'] > 70:
+            print(f"⚠️ {ticker} RSI_14 > 70: Consider selling or reducing weight.")
+        elif latest['RSI_14'] < 30:
+            print(f"⚠️ {ticker} RSI_14 < 30: Consider buying or increasing weight.")
+        
+        if latest['MACD'] > latest['Signal'] and latest['MACD_Histogram'] > 0:
+            print(f"📈 {ticker} MACD upward trend: Consider buying or increasing weight.")
+        elif latest['MACD'] < latest['Signal'] and latest['MACD_Histogram'] < 0:
+            print(f"📉 {ticker} MACD downward trend: Consider selling or reducing weight.")
+        
+        if latest['Close'] > latest['Upper_Band']:
+            print(f"🔺 {ticker} above Upper Bollinger Band: Consider selling or reducing weight.")
+        elif latest['Close'] < latest['Lower_Band']:
+            print(f"🔻 {ticker} below Lower Bollinger Band: Consider buying or increasing weight.")
+
+# Calculate initial investment from trade log
+def get_initial_investment(conn):
+    if not os.path.exists(TRADE_LOG_FILE):
+        return INITIAL_INVESTMENT
+    
+    trade_log = pd.read_csv(TRADE_LOG_FILE)
+    hold_trades = trade_log[trade_log['Action'].str.lower() == 'hold']
+    
+    if hold_trades.empty:
+        return INITIAL_INVESTMENT
+    
+    initial_value = 0.0
+    for _, trade in hold_trades.iterrows():
+        initial_value += trade['Shares'] * trade['Price']
+    
+    return initial_value
+
+# Main function
 def main():
-    parser = argparse.ArgumentParser(description='과거 2년간의 데이터를 수집하여 SQLite에 저장하고 포트폴리오를 관리')
-    parser.add_argument('--tickers', type=str, default='TSLA,TSLL', help='주식 티커 (쉼표로 구분, 기본: TSLA,TSLL)')
+    parser = argparse.ArgumentParser(description='Collect 2 years of data, store in SQLite, and manage portfolio')
+    parser.add_argument('--tickers', type=str, default='TSLA,TSLL', help='Stock tickers (comma-separated, default: TSLA,TSLL)')
     args = parser.parse_args()
     tickers = args.tickers.split(',')
 
-    # SQLite 데이터베이스 연결
     conn = sqlite3.connect(DB_FILE)
 
-    # 테이블 생성
-    conn.execute('''CREATE TABLE IF NOT EXISTS fear_greed_index (
-                        date TEXT PRIMARY KEY,
-                        fear_greed_index REAL)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS stock_data (
-                        Ticker TEXT,
-                        Date TEXT,
-                        Open REAL,
-                        High REAL,
-                        Low REAL,
-                        Close REAL,
-                        Volume INTEGER,
-                        PRIMARY KEY (Ticker, Date))''')  # 수정된 부분
-    conn.execute('''CREATE TABLE IF NOT EXISTS vix_data (
-                        Date TEXT PRIMARY KEY,
-                        VIX_Close REAL)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS technical_indicators (
-                        Ticker TEXT,
-                        Date TEXT,
-                        RSI_14 REAL,
-                        RSI_5 REAL,
-                        MACD REAL,
-                        Signal REAL,
-                        MACD_Histogram REAL,
-                        Short_MACD REAL,
-                        Short_Signal REAL,
-                        Short_MACD_Histogram REAL,
-                        SMA20 REAL,
-                        Upper_Band REAL,
-                        Lower_Band REAL,
-                        BB_Width REAL,
-                        Percent_K REAL,
-                        Percent_D REAL,
-                        OBV INTEGER,
-                        ATR REAL,
-                        SMA5 REAL,
-                        SMA10 REAL,
-                        SMA50 REAL,
-                        SMA200 REAL,
-                        Volume_Change REAL,
-                        VWAP REAL,
-                        Weekly_RSI REAL,
-                        PRIMARY KEY (Ticker, Date))''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS trade_log (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        Date TEXT,
-                        Ticker TEXT,
-                        Action TEXT,
-                        Shares INTEGER,
-                        Price REAL)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS portfolio_state (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        Date TEXT,
-                        Cash REAL,
-                        Ticker TEXT,
-                        Shares INTEGER)''')
+    # Create database tables
+    conn.execute('''CREATE TABLE IF NOT EXISTS fear_greed_index (date TEXT PRIMARY KEY, fear_greed_index REAL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS stock_data (Ticker TEXT, Date TEXT, Open REAL, High REAL, Low REAL, Close REAL, Volume INTEGER, PRIMARY KEY (Ticker, Date))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS vix_data (Date TEXT PRIMARY KEY, VIX_Close REAL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS technical_indicators (Ticker TEXT, Date TEXT, RSI_14 REAL, RSI_5 REAL, MACD REAL, Signal REAL, MACD_Histogram REAL, Short_MACD REAL, Short_Signal REAL, Short_MACD_Histogram REAL, SMA20 REAL, Upper_Band REAL, Lower_Band REAL, BB_Width REAL, Percent_K REAL, Percent_D REAL, OBV INTEGER, ATR REAL, SMA5 REAL, SMA10 REAL, SMA50 REAL, SMA200 REAL, Volume_Change REAL, VWAP REAL, Weekly_RSI REAL, PRIMARY KEY (Ticker, Date))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS trade_log (id INTEGER PRIMARY KEY AUTOINCREMENT, Date TEXT, Ticker TEXT, Action TEXT, Shares INTEGER, Price REAL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS portfolio_state (id INTEGER PRIMARY KEY AUTOINCREMENT, Date TEXT, Cash REAL, Ticker TEXT, Shares INTEGER)''')
 
-    # 데이터 수집 및 저장
-    print("Starting data collection...")
+    # Collect and store data
     get_fear_greed_data(conn)
     for ticker in tickers:
         get_stock_data(ticker, conn)
     get_vix_data(conn)
 
-    # 거래내역 처리 및 포트폴리오 상태 계산
+    # Process trade log and portfolio state
     load_trade_log_to_db(conn)
     process_portfolio(conn)
 
-    # 데이터 로드 및 지표 계산
+    # Load data and calculate indicators
     df_dict = {}
     for ticker in tickers:
         df = pd.read_sql(f'SELECT * FROM stock_data WHERE Ticker="{ticker}"', conn)
@@ -347,11 +356,16 @@ def main():
         df = df.sort_values('Date')
         df = calculate_all_indicators(df)
         df_dict[ticker] = df
-        print(f"Technical indicators calculation completed for {ticker}")
         save_indicators_to_db(df, ticker, conn)
 
+    # Get initial investment
+    initial_investment = get_initial_investment(conn)
+
+    # Visualize portfolio and provide weight adjustment notifications
+    visualize_portfolio_text(conn, tickers, initial_investment)
+    check_weight_adjustment(df_dict, tickers)
+
     conn.close()
-    print("All data collection, portfolio processing, and indicator calculations completed.")
 
 if __name__ == "__main__":
     main()

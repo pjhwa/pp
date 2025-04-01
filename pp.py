@@ -103,9 +103,9 @@ def calculate_rsi(df, period=14):
     return df
 
 def calculate_weekly_rsi(df, period=14):
-    """주간 RSI를 계산합니다. 'Date'가 인덱스인 경우 리셋합니다."""
+    """주간 RSI를 계산합니다."""
     if 'Date' not in df.columns:
-        df = df.reset_index()  # 인덱스를 컬럼으로 리셋
+        df = df.reset_index()
     df_weekly = df.resample('W', on='Date').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'})
     df_weekly = calculate_rsi(df_weekly, period)
     return df_weekly.rename(columns={f'RSI_{period}': 'Weekly_RSI'})['Weekly_RSI']
@@ -168,9 +168,9 @@ def calculate_all_indicators(df):
             raise ValueError("DataFrame must have a 'Date' column or a DatetimeIndex")
 
     df = calculate_rsi(df, 14)
-    df = calculate_rsi(df, 5)  # 단기 RSI
+    df = calculate_rsi(df, 5)
     df = calculate_macd(df, 12, 26, 9, '')
-    df = calculate_macd(df, 5, 13, 1, 'Short_')  # 단기 MACD
+    df = calculate_macd(df, 5, 13, 1, 'Short_')
     df = calculate_bollinger_bands(df)
     df = calculate_sma(df, 5)
     df = calculate_sma(df, 10)
@@ -299,8 +299,7 @@ def adjust_portfolio(df, buy_signals, sell_signals, thresholds, weights, current
 
     net_adjustment = increase - decrease
     atr_factor = min(atr / 10.0, 1.0)
-    net_adjustment *= (1 - atr_factor)  # ATR 기반 동적 조정
-
+    net_adjustment *= (1 - atr_factor)
     target_weight = max(min(current_weight + net_adjustment, 1.0), 0.0)
     return target_weight
 
@@ -349,7 +348,7 @@ def backtest_strategy(df, ticker, initial_cash=INITIAL_INVESTMENT, thresholds=No
 
     return pd.DataFrame(portfolio_value), pd.DataFrame(trade_history)
 
-# 데이터베이스 관리 함수 (최적 파라미터 저장 및 로드)
+# 데이터베이스 관리 함수
 def save_optimal_parameters(conn, ticker, thresholds, weights, return_rate):
     """최적 파라미터를 데이터베이스에 저장합니다."""
     cursor = conn.cursor()
@@ -470,6 +469,7 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
         print("Optimal parameters not found. Please run backtest first.")
         return
 
+    # 데이터베이스에서 전체 기간 데이터 가져오기
     df_tsla = pd.read_sql(f"SELECT * FROM stock_data WHERE Ticker='TSLA' AND Date >= '{start_date}' AND Date <= '{end_date}'", conn)
     df_tsll = pd.read_sql(f"SELECT * FROM stock_data WHERE Ticker='TSLL' AND Date >= '{start_date}' AND Date <= '{end_date}'", conn)
     if df_tsla.empty or df_tsll.empty:
@@ -483,7 +483,7 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
     df_tsla = calculate_all_indicators(df_tsla)
     df_tsll = calculate_all_indicators(df_tsll)
 
-    # SMA200 첫 유효 날짜 확인
+    # SMA200 계산을 위한 최소 데이터 확인
     first_valid_date_tsla = df_tsla['SMA200'].first_valid_index()
     first_valid_date_tsll = df_tsll['SMA200'].first_valid_index()
     if first_valid_date_tsla is None or first_valid_date_tsll is None:
@@ -505,10 +505,10 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
                 print("Not enough historical data available in the database for SMA200 calculation.")
         return
 
-    # 시뮬레이션 시작 날짜 설정 및 공통 날짜 필터링
+    # 시뮬레이션 날짜 설정
     simulation_start = max(first_valid_date_tsla, first_valid_date_tsll)
     dates = df_tsla.index.intersection(df_tsll.index)
-    simulation_dates = dates[dates >= simulation_start]
+    simulation_dates = dates[(dates >= simulation_start) & (dates >= pd.to_datetime(start_date)) & (dates <= pd.to_datetime(end_date))]
     if simulation_dates.empty:
         print("No overlapping dates for simulation with valid SMA200.")
         cursor = conn.cursor()
@@ -568,7 +568,7 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
             holdings['TSLA'] -= shares_to_sell
             cash += revenue
 
-        # TSLL 조정 (버그 수정)
+        # TSLL 조정
         if target_tsll_shares > holdings['TSLL']:
             shares_to_buy = target_tsll_shares - holdings['TSLL']
             cost = shares_to_buy * price_tsll * (1 + TRANSACTION_COST_RATE)
@@ -588,14 +588,24 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
     final_value = portfolio_df['Portfolio Value'].iloc[-1]
     return_rate = (final_value - initial_cash) / initial_cash * 100
 
+    # 시뮬레이션 결과 출력
     print(f"\n{'='*50}\nSimulation Results:\n{'='*50}")
     print(f"Initial Investment: ${initial_cash:.2f}")
     print(f"Final Portfolio Value: ${final_value:.2f}")
     print(f"Total Return Rate: {return_rate:.2f}%")
-    print("\nDaily Portfolio Values:")
-    print(tabulate(portfolio_df, headers='keys', tablefmt='fancy_grid', showindex=False))
+    print("\nDaily Portfolio Values (Last 15 Days):")
 
-# 데이터베이스 관리 함수 (기존)
+    # 최근 15일 출력
+    if len(portfolio_df) > 15:
+        print(tabulate(portfolio_df.tail(15), headers='keys', tablefmt='fancy_grid', showindex=False))
+    else:
+        print(tabulate(portfolio_df, headers='keys', tablefmt='fancy_grid', showindex=False))
+
+    # CSV 파일에 전체 데이터 저장
+    portfolio_df.to_csv('simulation_portfolio_values.csv', index=False)
+    print("Full portfolio values saved to 'simulation_portfolio_values.csv'")
+
+# 데이터베이스 관리 함수
 def save_indicators_to_db(df, ticker, conn):
     indicators = ['RSI_14', 'RSI_5', 'MACD', 'Signal', 'MACD_Histogram', 'Short_MACD', 'Short_Signal',
                   'Short_MACD_Histogram', 'SMA20', 'Upper_Band', 'Lower_Band', 'BB_Width', 'SMA5',
@@ -786,11 +796,11 @@ def check_weight_adjustment(df_dict, tickers, total_value, prices, conn, holding
 # 메인 함수
 def main():
     parser = argparse.ArgumentParser(description='Manage portfolio and perform backtesting/simulation')
-    parser.add_argument('--tickers', type=str, default='TSLA,TSLL', help='쉼표로 구분된 주식 티커')
-    parser.add_argument('--backtest', action='store_true', help='백테스팅 실행')
-    parser.add_argument('--simulate', action='store_true', help='최적화된 임계값으로 시뮬레이션 실행')
-    parser.add_argument('--start_date', type=str, default=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'), help='시작 날짜 (YYYY-MM-DD)')
-    parser.add_argument('--end_date', type=str, default=datetime.now().strftime('%Y-%m-%d'), help='종료 날짜 (YYYY-MM-DD)')
+    parser.add_argument('--tickers', type=str, default='TSLA,TSLL', help='Comma-separated stock tickers')
+    parser.add_argument('--backtest', action='store_true', help='Run backtesting')
+    parser.add_argument('--simulate', action='store_true', help='Run simulation with optimized thresholds')
+    parser.add_argument('--start_date', type=str, default=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'), help='Start date (YYYY-MM-DD)')
+    parser.add_argument('--end_date', type=str, default=datetime.now().strftime('%Y-%m-%d'), help='End date (YYYY-MM-DD)')
     args = parser.parse_args()
     tickers = args.tickers.split(',')
 

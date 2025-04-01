@@ -11,7 +11,6 @@ import numpy as np
 from termcolor import colored
 from deap import base, creator, tools, algorithms
 from tqdm import tqdm
-import multiprocessing
 import json
 
 # 상수 정의
@@ -43,7 +42,7 @@ def get_fear_greed_data(conn):
         df = df[['date', 'y']].rename(columns={'y': 'fear_greed_index'})
         df.to_sql('fear_greed_index', conn, if_exists='replace', index=False)
     except Exception:
-        pass  # 오류 억제
+        pass
 
 def get_stock_data(ticker, conn):
     """주식 데이터를 점진적으로 가져와 저장합니다."""
@@ -103,7 +102,6 @@ def calculate_rsi(df, period=14):
     return df
 
 def calculate_weekly_rsi(df, period=14):
-    """주간 RSI를 계산합니다."""
     if 'Date' not in df.columns:
         df = df.reset_index()
     df_weekly = df.resample('W', on='Date').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'})
@@ -159,14 +157,12 @@ def calculate_volume_change(df):
     return df
 
 def calculate_all_indicators(df):
-    """모든 지표를 계산합니다."""
     if not isinstance(df.index, pd.DatetimeIndex):
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.set_index('Date')
         else:
             raise ValueError("DataFrame must have a 'Date' column or a DatetimeIndex")
-
     df = calculate_rsi(df, 14)
     df = calculate_rsi(df, 5)
     df = calculate_macd(df, 12, 26, 9, '')
@@ -186,9 +182,8 @@ def calculate_all_indicators(df):
     df['Weekly_RSI'] = weekly_rsi
     return df
 
-# 신호 생성 함수
+# 신호 생성 및 점수화 함수
 def generate_signals(df, thresholds, fear_greed, vix):
-    """매수/매도 신호를 생성합니다."""
     buy_signals = []
     sell_signals = []
 
@@ -268,11 +263,13 @@ def generate_signals(df, thresholds, fear_greed, vix):
     if df['Close'].iloc[-1] < df['VWAP'].iloc[-1]:
         sell_signals.append("Close < VWAP")
 
-    return buy_signals, sell_signals
+    # 신호 점수화 (10점 만점)
+    buy_points = min(len(buy_signals) * 2, 10)  # 신호 1개당 2점, 최대 10점
+    sell_points = min(len(sell_signals) * 2, 10)
+    return buy_signals, sell_signals, buy_points, sell_points
 
 # 포트폴리오 조정 함수
 def adjust_portfolio(df, buy_signals, sell_signals, thresholds, weights, current_weight, atr):
-    """가중치와 ATR을 기반으로 포트폴리오 비중을 조정합니다."""
     strong_buy_count = sum(1 for signal in buy_signals if "strong" in signal.lower())
     weak_buy_count = sum(1 for signal in buy_signals if "weak" in signal.lower())
     other_buy_count = len(buy_signals) - strong_buy_count - weak_buy_count
@@ -298,14 +295,13 @@ def adjust_portfolio(df, buy_signals, sell_signals, thresholds, weights, current
                 weights['w_short_sell'] * short_sell_count) * 0.1
 
     net_adjustment = increase - decrease
-    atr_factor = min(atr / 10.0, 1.0)
+    atr_factor = min(atr / 20.0, 0.5)  # ATR 영향 감소 (최대 50% 감소)
     net_adjustment *= (1 - atr_factor)
     target_weight = max(min(current_weight + net_adjustment, 1.0), 0.0)
     return target_weight
 
 # 백테스트 함수
 def backtest_strategy(df, ticker, initial_cash=INITIAL_INVESTMENT, thresholds=None, weights=None):
-    """주어진 전략으로 백테스트를 수행합니다."""
     if thresholds is None or weights is None:
         raise ValueError("Thresholds and weights must be provided")
 
@@ -324,7 +320,7 @@ def backtest_strategy(df, ticker, initial_cash=INITIAL_INVESTMENT, thresholds=No
         fear_greed = fear_greed_row[0] if fear_greed_row else 50.0
         vix_row = conn.cursor().execute(f"SELECT VIX_Close FROM vix_data WHERE Date <= '{date.strftime('%Y-%m-%d')}' ORDER BY Date DESC LIMIT 1").fetchone()
         vix = vix_row[0] if vix_row else 20.0
-        buy_signals, sell_signals = generate_signals(df.loc[:date], thresholds, fear_greed, vix)
+        buy_signals, sell_signals, _, _ = generate_signals(df.loc[:date], thresholds, fear_greed, vix)
         current_weight = (shares * row['Close']) / (cash + shares * row['Close']) if (cash + shares * row['Close']) > 0 else 0.0
         target_weight = adjust_portfolio(df.loc[:date], buy_signals, sell_signals, thresholds, weights, current_weight, row['ATR'])
 
@@ -350,7 +346,6 @@ def backtest_strategy(df, ticker, initial_cash=INITIAL_INVESTMENT, thresholds=No
 
 # 데이터베이스 관리 함수
 def save_optimal_parameters(conn, ticker, thresholds, weights, return_rate):
-    """최적 파라미터를 데이터베이스에 저장합니다."""
     cursor = conn.cursor()
     thresholds_json = json.dumps(thresholds)
     weights_json = json.dumps(weights)
@@ -359,7 +354,6 @@ def save_optimal_parameters(conn, ticker, thresholds, weights, return_rate):
     conn.commit()
 
 def load_optimal_parameters(conn, ticker):
-    """최적 파라미터를 데이터베이스에서 로드합니다."""
     cursor = conn.cursor()
     cursor.execute("SELECT thresholds, weights, return_rate FROM optimal_parameters WHERE ticker = ?", (ticker,))
     row = cursor.fetchone()
@@ -371,32 +365,31 @@ def load_optimal_parameters(conn, ticker):
     return None, None, None
 
 # 유전 알고리즘 최적화 함수
-def genetic_algorithm_optimize(df, ticker, generations=20, pop_size=50):
-    """임계값과 가중치를 최적화하여 수익률을 최대화합니다."""
+def genetic_algorithm_optimize(df, ticker, generations=50, pop_size=100):
     toolbox = base.Toolbox()
 
-    toolbox.register("fg_buy", np.random.uniform, 20, 40)
-    toolbox.register("fg_sell", np.random.uniform, 60, 80)
-    toolbox.register("daily_rsi_buy", np.random.uniform, 20, 40)
-    toolbox.register("daily_rsi_sell", np.random.uniform, 60, 80)
-    toolbox.register("weekly_rsi_buy", np.random.uniform, 20, 40)
-    toolbox.register("weekly_rsi_sell", np.random.uniform, 60, 80)
-    toolbox.register("short_rsi_buy", np.random.uniform, 20, 40)
-    toolbox.register("short_rsi_sell", np.random.uniform, 60, 80)
-    toolbox.register("stochastic_buy", np.random.uniform, 10, 30)
-    toolbox.register("stochastic_sell", np.random.uniform, 70, 90)
-    toolbox.register("volume_change_strong_buy", np.random.uniform, 0.1, 0.5)
-    toolbox.register("volume_change_weak_buy", np.random.uniform, 0.05, 0.2)
-    toolbox.register("volume_change_sell", np.random.uniform, -0.5, -0.1)
-    toolbox.register("bb_width_low", np.random.uniform, 0.05, 0.2)
-    toolbox.register("bb_width_high", np.random.uniform, 0.3, 0.5)
-    toolbox.register("w_strong_buy", np.random.uniform, 1, 3)
-    toolbox.register("w_weak_buy", np.random.uniform, 0.5, 1.5)
-    toolbox.register("w_sell", np.random.uniform, 1, 3)
-    toolbox.register("obv_weight", np.random.uniform, 0.5, 2)
-    toolbox.register("bb_width_weight", np.random.uniform, 0.5, 2)
-    toolbox.register("w_short_buy", np.random.uniform, 0.5, 1.5)
-    toolbox.register("w_short_sell", np.random.uniform, 0.5, 1.5)
+    toolbox.register("fg_buy", np.random.uniform, 10, 50)
+    toolbox.register("fg_sell", np.random.uniform, 50, 90)
+    toolbox.register("daily_rsi_buy", np.random.uniform, 10, 50)
+    toolbox.register("daily_rsi_sell", np.random.uniform, 50, 90)
+    toolbox.register("weekly_rsi_buy", np.random.uniform, 10, 50)
+    toolbox.register("weekly_rsi_sell", np.random.uniform, 50, 90)
+    toolbox.register("short_rsi_buy", np.random.uniform, 10, 50)
+    toolbox.register("short_rsi_sell", np.random.uniform, 50, 90)
+    toolbox.register("stochastic_buy", np.random.uniform, 5, 40)
+    toolbox.register("stochastic_sell", np.random.uniform, 60, 95)
+    toolbox.register("volume_change_strong_buy", np.random.uniform, 0.1, 1.0)
+    toolbox.register("volume_change_weak_buy", np.random.uniform, 0.01, 0.3)
+    toolbox.register("volume_change_sell", np.random.uniform, -1.0, -0.1)
+    toolbox.register("bb_width_low", np.random.uniform, 0.01, 0.3)
+    toolbox.register("bb_width_high", np.random.uniform, 0.3, 1.0)
+    toolbox.register("w_strong_buy", np.random.uniform, 1, 5)
+    toolbox.register("w_weak_buy", np.random.uniform, 0.5, 3)
+    toolbox.register("w_sell", np.random.uniform, 1, 5)
+    toolbox.register("obv_weight", np.random.uniform, 0.5, 3)
+    toolbox.register("bb_width_weight", np.random.uniform, 0.5, 3)
+    toolbox.register("w_short_buy", np.random.uniform, 0.5, 3)
+    toolbox.register("w_short_sell", np.random.uniform, 0.5, 3)
 
     toolbox.register("individual", tools.initCycle, creator.Individual,
                      (toolbox.fg_buy, toolbox.fg_sell, toolbox.daily_rsi_buy, toolbox.daily_rsi_sell,
@@ -428,7 +421,7 @@ def genetic_algorithm_optimize(df, ticker, generations=20, pop_size=50):
         return return_rate,
 
     toolbox.register("mate", tools.cxUniform, indpb=0.5)
-    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.2)
+    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.3)  # 돌연변이 확률 증가
     toolbox.register("select", tools.selTournament, tournsize=3)
     toolbox.register("evaluate", evaluate)
 
@@ -436,8 +429,8 @@ def genetic_algorithm_optimize(df, ticker, generations=20, pop_size=50):
     hof = tools.HallOfFame(1)
 
     for gen in tqdm(range(generations), desc=f"Optimizing for {ticker}"):
-        pop = algorithms.varAnd(pop, toolbox, cxpb=0.7, mutpb=0.2)
-        fits = toolbox.map(toolbox.evaluate, pop)
+        pop = algorithms.varAnd(pop, toolbox, cxpb=0.8, mutpb=0.3)  # 교차 및 돌연변이 확률 조정
+        fits = list(map(toolbox.evaluate, pop))
         for fit, ind in zip(fits, pop):
             ind.fitness.values = fit
         pop = toolbox.select(pop, k=len(pop))
@@ -461,15 +454,13 @@ def genetic_algorithm_optimize(df, ticker, generations=20, pop_size=50):
     return_rate = hof[0].fitness.values[0]
     return optimized_thresholds, optimized_weights, return_rate
 
-# 시뮬레이션 함수 (개선됨)
-def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
-    """최적 파라미터를 사용하여 포트폴리오를 매일 조정하고 성과를 추적합니다."""
+# 시뮬레이션 함수
+def simulate_portfolio(conn, start_date, end_date, initial_cash=INITIAL_INVESTMENT):
     thresholds, weights, _ = load_optimal_parameters(conn, 'TSLA')
     if thresholds is None or weights is None:
         print("Optimal parameters not found. Please run backtest first.")
         return
 
-    # 데이터베이스에서 전체 기간 데이터 가져오기
     df_tsla = pd.read_sql(f"SELECT * FROM stock_data WHERE Ticker='TSLA' AND Date >= '{start_date}' AND Date <= '{end_date}'", conn)
     df_tsll = pd.read_sql(f"SELECT * FROM stock_data WHERE Ticker='TSLL' AND Date >= '{start_date}' AND Date <= '{end_date}'", conn)
     if df_tsla.empty or df_tsll.empty:
@@ -483,52 +474,17 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
     df_tsla = calculate_all_indicators(df_tsla)
     df_tsll = calculate_all_indicators(df_tsll)
 
-    # SMA200 계산을 위한 최소 데이터 확인
     first_valid_date_tsla = df_tsla['SMA200'].first_valid_index()
     first_valid_date_tsll = df_tsll['SMA200'].first_valid_index()
     if first_valid_date_tsla is None or first_valid_date_tsll is None:
-        print("Insufficient data for one or both tickers to compute SMA200.")
-        cursor = conn.cursor()
-        cursor.execute("SELECT MIN(Date) FROM stock_data WHERE Ticker='TSLA'")
-        min_date_tsla = cursor.fetchone()[0]
-        cursor.execute("SELECT MIN(Date) FROM stock_data WHERE Ticker='TSLL'")
-        min_date_tsll = cursor.fetchone()[0]
-        if min_date_tsla and min_date_tsll:
-            min_date = max(min_date_tsla, min_date_tsll)
-            required_days = 200
-            cursor.execute(f"SELECT Date FROM stock_data WHERE Ticker='TSLA' AND Date <= '{end_date}' ORDER BY Date DESC LIMIT {required_days}")
-            dates_before = [row[0] for row in cursor.fetchall()]
-            if len(dates_before) >= required_days:
-                required_start_date = dates_before[-1]
-                print(f"To have sufficient data for SMA200, set start_date to at least {required_start_date}")
-            else:
-                print("Not enough historical data available in the database for SMA200 calculation.")
+        print("Insufficient data for SMA200 calculation.")
         return
 
-    # 시뮬레이션 날짜 설정
     simulation_start = max(first_valid_date_tsla, first_valid_date_tsll)
     dates = df_tsla.index.intersection(df_tsll.index)
     simulation_dates = dates[(dates >= simulation_start) & (dates >= pd.to_datetime(start_date)) & (dates <= pd.to_datetime(end_date))]
     if simulation_dates.empty:
-        print("No overlapping dates for simulation with valid SMA200.")
-        cursor = conn.cursor()
-        cursor.execute("SELECT MIN(Date), MAX(Date) FROM stock_data WHERE Ticker='TSLA'")
-        tsla_min, tsla_max = cursor.fetchone()
-        cursor.execute("SELECT MIN(Date), MAX(Date) FROM stock_data WHERE Ticker='TSLL'")
-        tsll_min, tsll_max = cursor.fetchone()
-        if tsla_min and tsll_min:
-            overlap_start = max(tsla_min, tsll_min)
-            overlap_end = min(tsla_max, tsll_max)
-            if overlap_start <= overlap_end:
-                cursor.execute(f"SELECT Date FROM stock_data WHERE Ticker='TSLA' AND Date <= '{overlap_end}' ORDER BY Date DESC LIMIT 200")
-                dates_before = [row[0] for row in cursor.fetchall()]
-                if len(dates_before) >= 200:
-                    required_start_date = dates_before[-1]
-                    print(f"To have sufficient overlapping data for SMA200, set start_date to at least {required_start_date}")
-                else:
-                    print("Not enough overlapping historical data available for SMA200 calculation.")
-            else:
-                print("No overlapping data period exists for the tickers.")
+        print("No valid simulation dates with SMA200 data.")
         return
 
     cash = initial_cash
@@ -545,7 +501,7 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
         vix_row = conn.cursor().execute(f"SELECT VIX_Close FROM vix_data WHERE Date <= '{date.strftime('%Y-%m-%d')}' ORDER BY Date DESC LIMIT 1").fetchone()
         vix = vix_row[0] if vix_row else 20.0
 
-        buy_signals, sell_signals = generate_signals(df_up_to_date, thresholds, fear_greed, vix)
+        buy_signals, sell_signals, buy_points, sell_points = generate_signals(df_up_to_date, thresholds, fear_greed, vix)
         current_value = cash + holdings['TSLA'] * price_tsla + holdings['TSLL'] * price_tsll
         current_tsla_weight = (holdings['TSLA'] * price_tsla) / current_value if current_value > 0 else 0.0
         atr = df_up_to_date['ATR'].iloc[-1] if 'ATR' in df_up_to_date.columns else 0.0
@@ -555,7 +511,6 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
         target_tsla_shares = math.floor((current_value * target_tsla_weight) / price_tsla / 100) * 100
         target_tsll_shares = math.floor((current_value * target_tsll_weight) / price_tsll / 100) * 100
 
-        # TSLA 조정
         if target_tsla_shares > holdings['TSLA']:
             shares_to_buy = target_tsla_shares - holdings['TSLA']
             cost = shares_to_buy * price_tsla * (1 + TRANSACTION_COST_RATE)
@@ -568,7 +523,6 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
             holdings['TSLA'] -= shares_to_sell
             cash += revenue
 
-        # TSLL 조정
         if target_tsll_shares > holdings['TSLL']:
             shares_to_buy = target_tsll_shares - holdings['TSLL']
             cost = shares_to_buy * price_tsll * (1 + TRANSACTION_COST_RATE)
@@ -582,26 +536,31 @@ def simulate_portfolio(conn, start_date, end_date, initial_cash=100000.0):
             cash += revenue
 
         total_value = cash + holdings['TSLA'] * price_tsla + holdings['TSLL'] * price_tsll
-        portfolio_values.append({'Date': date, 'Portfolio Value': total_value})
+        tsla_weight = (holdings['TSLA'] * price_tsla) / total_value * 100 if total_value > 0 else 0.0
+        tsll_weight = (holdings['TSLL'] * price_tsll) / total_value * 100 if total_value > 0 else 0.0
+        portfolio_values.append({
+            'Date': date,
+            'Portfolio Value': total_value,
+            'Portfolio Weight': f"TSLA:{tsla_weight:.1f}% TSLL:{tsll_weight:.1f}%",
+            'Signals': f"Buy Signals: {buy_points} points, Sell Signals: {sell_points} points"
+        })
 
     portfolio_df = pd.DataFrame(portfolio_values)
     final_value = portfolio_df['Portfolio Value'].iloc[-1]
     return_rate = (final_value - initial_cash) / initial_cash * 100
+    simulation_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days + 1
 
-    # 시뮬레이션 결과 출력
     print(f"\n{'='*50}\nSimulation Results:\n{'='*50}")
+    print(f"Simulation Duration: {start_date} ~ {end_date} ({simulation_days} Days)")
     print(f"Initial Investment: ${initial_cash:.2f}")
     print(f"Final Portfolio Value: ${final_value:.2f}")
     print(f"Total Return Rate: {return_rate:.2f}%")
     print("\nDaily Portfolio Values (Last 15 Days):")
-
-    # 최근 15일 출력
     if len(portfolio_df) > 15:
         print(tabulate(portfolio_df.tail(15), headers='keys', tablefmt='fancy_grid', showindex=False))
     else:
         print(tabulate(portfolio_df, headers='keys', tablefmt='fancy_grid', showindex=False))
 
-    # CSV 파일에 전체 데이터 저장
     portfolio_df.to_csv('simulation_portfolio_values.csv', index=False)
     print("Full portfolio values saved to 'simulation_portfolio_values.csv'")
 
@@ -772,7 +731,7 @@ def check_weight_adjustment(df_dict, tickers, total_value, prices, conn, holding
     else:
         print("Loaded existing optimal parameters for TSLA.")
 
-    buy_signals, sell_signals = generate_signals(tsla_df, thresholds, fear_greed, vix)
+    buy_signals, sell_signals, buy_points, sell_points = generate_signals(tsla_df, thresholds, fear_greed, vix)
     target_tsla_weight = adjust_portfolio(tsla_df, buy_signals, sell_signals, thresholds, weights, current_tsla_weight, current['ATR'])
     target_tsll_weight = 1.0 - target_tsla_weight
 
@@ -789,8 +748,12 @@ def check_weight_adjustment(df_dict, tickers, total_value, prices, conn, holding
     print("\n**Proposed Portfolio Changes**")
     print(tabulate(pd.DataFrame(proposed), headers='keys', tablefmt='fancy_grid', showindex=False))
     print("\n**Adjustment Rationale**")
-    print(f"- Buy Signals: {', '.join(buy_signals) if buy_signals else 'None'}")
-    print(f"- Sell Signals: {', '.join(sell_signals) if sell_signals else 'None'}")
+    print(f"Buy Signals (points: {buy_points}):")
+    for signal in buy_signals if buy_signals else ["None"]:
+        print(f"  . {signal}")
+    print(f"Sell Signals (points: {sell_points}):")
+    for signal in sell_signals if sell_signals else ["None"]:
+        print(f"  . {signal}")
     print(f"- ATR: {current['ATR']:.2f}, VIX: {vix:.2f}")
 
 # 메인 함수
@@ -847,7 +810,7 @@ def main():
 
     if args.backtest:
         df = pd.read_sql(f"SELECT * FROM stock_data WHERE Ticker='TSLA' AND Date BETWEEN '{args.start_date}' AND '{args.end_date}'", conn)
-        if not df.empty and len(df) >= 50:
+        if not df.empty and len(df) >= 200:  # 최소 200일 데이터 필요
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.sort_values('Date')
             df = calculate_all_indicators(df)
@@ -855,9 +818,15 @@ def main():
             existing_thresholds, existing_weights, existing_return_rate = load_optimal_parameters(conn, 'TSLA')
             if existing_return_rate is None or return_rate > existing_return_rate:
                 save_optimal_parameters(conn, 'TSLA', thresholds, weights, return_rate)
-                print(f"Updated optimal parameters for TSLA with return rate: {return_rate*100:.2f}%")
+                print(f"\nUpdated optimal parameters for TSLA with return rate: {return_rate*100:.2f}%")
+                print("Optimized Thresholds:")
+                for key, value in thresholds.items():
+                    print(f"  - {key}: {value:.2f}")
+                print("Optimized Weights:")
+                for key, value in weights.items():
+                    print(f"  - {key}: {value:.2f}")
             else:
-                print(f"Existing parameters are better or equal with return rate: {existing_return_rate*100:.2f}%. No update.")
+                print(f"\nExisting parameters are better or equal with return rate: {existing_return_rate*100:.2f}%. No update.")
             portfolio_df, trade_df = backtest_strategy(df, 'TSLA', thresholds=thresholds, weights=weights)
             metrics = {
                 'Total Return (%)': (portfolio_df['Portfolio Value'].iloc[-1] - INITIAL_INVESTMENT) / INITIAL_INVESTMENT * 100,
@@ -865,8 +834,11 @@ def main():
             }
             print(f"\nBacktest Results for TSLA:")
             print(tabulate(portfolio_df.tail(), headers='keys', tablefmt='fancy_grid', showindex=False))
-            print(tabulate(trade_df.tail(), headers='keys', tablefmt='fancy_grid', showindex=False))
+            if not trade_df.empty:
+                print(tabulate(trade_df.tail(), headers='keys', tablefmt='fancy_grid', showindex=False))
             print(tabulate(pd.DataFrame([metrics]), headers='keys', tablefmt='fancy_grid', showindex=False))
+        else:
+            print("Insufficient data for backtest (minimum 200 days required).")
     elif args.simulate:
         simulate_portfolio(conn, args.start_date, args.end_date)
     else:
